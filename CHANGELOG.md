@@ -9,6 +9,19 @@ For help with updating to new Bytewax versions, please see the
 __Add any extra change notes here and we'll put them in the release
 notes on GitHub when we make a new release.__
 
+- Adds a `bytewax.operators.temporal_join` operator: a temporal
+  (as-of) join that matches each fact with the dimension version in
+  effect at the fact's event time, e.g. to attribute transactions to
+  the customer tier that was current when they happened. The
+  dimension stream takes `DimUpsert` / `DimDelete` / `DimWatermark`
+  CDC events; versions are ordered deterministically by
+  `(effective_at, seq)`. Facts wait for the dimension frontier to
+  pass their event time before being emitted, facts older than the
+  retained history are routed to a separate `expired` stream, and
+  version collection never removes versions that waiting facts can
+  still resolve to. All state is snapshotted, so join results are
+  identical after resuming from an interruption.
+
 - Adds `bytewax.__version__`, exposing the installed package version
   from Python code, e.g. when sanity-checking an environment or
   reporting a bug. It is read from the package metadata, so importing

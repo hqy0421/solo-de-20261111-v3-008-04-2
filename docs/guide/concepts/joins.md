@@ -726,3 +726,100 @@ Notice there are now two output values for that key.
 join_eg.check_join: ('123', (8328, ({'user_id': 123, 'at': datetime.datetime(2023, 12, 14, 0, 0, tzinfo=datetime.timezone.utc), 'name': 'Bee'}, {'user_id': 123, 'at': datetime.datetime(2023, 12, 14, 0, 15, tzinfo=datetime.timezone.utc), 'email': 'bee@bytewax.io'})))
 join_eg.check_join: ('123', (8328, ({'user_id': 123, 'at': datetime.datetime(2023, 12, 14, 0, 0, tzinfo=datetime.timezone.utc), 'name': 'Bee'}, {'user_id': 123, 'at': datetime.datetime(2023, 12, 14, 0, 30, tzinfo=datetime.timezone.utc), 'email': 'queen@bytewax.io'})))
 ```
+
+## Temporal Joins
+
+All of the joins above match values by when they _arrive_. Sometimes
+you instead need to match by when things _happened_: for example,
+attributing each transaction to the customer tier that was in effect
+at the transaction's event time, while a CDC feed keeps updating the
+customer dimension table. Joining against the latest arrived tier
+would silently re-attribute old transactions to the new tier.
+
+The {py:obj}`~bytewax.operators.temporal_join` operator is a
+temporal (as-of) join for this. The dimension side is a keyed stream
+of {py:obj}`~bytewax.operators.DimUpsert`,
+{py:obj}`~bytewax.operators.DimDelete`, and
+{py:obj}`~bytewax.operators.DimWatermark` events, and each fact is
+matched with the dimension version effective at the fact's event
+time:
+
+```{testcode}
+from datetime import datetime, timedelta, timezone
+
+from bytewax.dataflow import Dataflow
+import bytewax.operators as op
+from bytewax.operators import DimUpsert, DimWatermark
+from bytewax.testing import TestingSource
+
+flow = Dataflow("temporal_eg")
+
+facts_l = [
+    ("cust_1", {"tx": "tx_1", "at": datetime(2024, 1, 10, tzinfo=timezone.utc)}),
+    ("cust_1", {"tx": "tx_2", "at": datetime(2024, 2, 10, tzinfo=timezone.utc)}),
+]
+facts = op.input("facts", flow, TestingSource(facts_l))
+
+dim_l = [
+    ("cust_1", DimUpsert(datetime(2024, 1, 1, tzinfo=timezone.utc), "silver", seq=1)),
+    ("cust_1", DimUpsert(datetime(2024, 2, 1, tzinfo=timezone.utc), "gold", seq=2)),
+    ("cust_1", DimWatermark(datetime(2024, 3, 1, tzinfo=timezone.utc))),
+]
+dim = op.input("dim", flow, TestingSource(dim_l))
+
+out = op.temporal_join(
+    "temporal_join",
+    facts,
+    dim,
+    fact_ts=lambda tx: tx["at"],
+    retention=timedelta(days=30),
+)
+tiers = op.map_value("tiers", out.joined, lambda j: (j.fact["tx"], j.dim))
+_ = op.inspect("joined", tiers)
+```
+
+```{testcode}
+:hide:
+
+from bytewax.testing import run_main
+
+run_main(flow)
+```
+
+`tx_1` is attributed to the tier in effect at its event time, even
+though the customer had already been upgraded when the transaction
+was processed:
+
+```{testoutput}
+temporal_eg.joined: ('cust_1', ('tx_1', 'silver'))
+temporal_eg.joined: ('cust_1', ('tx_2', 'gold'))
+```
+
+Things to know about how it behaves:
+
+- **Facts wait for the dimension to catch up.** A fact is only
+  emitted once the key's frontier — the time through which the
+  dimension is complete — has passed the fact's event time. The
+  frontier advances with each dimension event and each
+  {py:obj}`~bytewax.operators.DimWatermark`, and everything still
+  waiting is emitted when the upstream is EOF.
+
+- **Same-time versions are deterministic.** Versions of a key are
+  ordered by `(effective_at, seq)`; give `seq` a monotonic CDC
+  position (LSN, Kafka offset) and the result does not depend on
+  arrival order or redelivery.
+
+- **Deletes are tombstones.** A fact after a
+  {py:obj}`~bytewax.operators.DimDelete` resolves with
+  `status="deleted"` and no dimension value.
+
+- **History is bounded by `retention`.** Versions older than
+  `retention` behind the frontier are collected once no waiting fact
+  can still resolve to them. Facts that arrive older than the
+  retained history are emitted on the `expired` stream with their
+  event time and the horizon they fell below, instead of being
+  joined to a potentially wrong version.
+
+- **Recovery is consistent.** Versions, waiting facts, and the
+  frontier are all part of the operator's snapshotted state, so
+  resuming after an interruption produces the same join results.

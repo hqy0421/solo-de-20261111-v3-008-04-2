@@ -25,6 +25,7 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    cast,
     overload,
 )
 
@@ -3005,3 +3006,526 @@ def stateful_map(
         return (s, (w,))
 
     return stateful_flat_map("stateful_flat_map", up, shim_mapper)
+
+
+F = TypeVar("F")
+"""Type of fact items."""
+
+
+@dataclass(frozen=True)
+class DimUpsert(Generic[V]):
+    """A CDC upsert of a dimension value, effective at a point in time.
+
+    Emitted on the dimension stream of {py:obj}`temporal_join` to
+    record that a key has the given value starting at `effective_at`.
+
+    """
+
+    effective_at: datetime
+    """Event time at which this version of the value becomes
+    effective."""
+
+    value: V
+    """The dimension value, e.g. the customer tier."""
+
+    seq: Any = 0
+    """Deterministic ordering tie-break between versions with the same
+    `effective_at`.
+
+    Versions of the same key and `effective_at` are ordered by `seq`;
+    the version with the greatest `seq` is the effective one. Use a
+    monotonic CDC position such as a log sequence number or a Kafka
+    offset. All values of `seq` for a key must be mutually comparable.
+
+    """
+
+
+@dataclass(frozen=True)
+class DimDelete:
+    """A CDC delete (tombstone) of a dimension key.
+
+    Facts at or after `effective_at` resolve to no dimension value
+    (status `"deleted"`) until a later {py:obj}`DimUpsert` for the key
+    supersedes the delete.
+
+    """
+
+    effective_at: datetime
+    """Event time at which the key was deleted."""
+
+    seq: Any = 0
+    """Deterministic ordering tie-break; see {py:obj}`DimUpsert.seq`."""
+
+
+@dataclass(frozen=True)
+class DimWatermark:
+    """Declare that the dimension is complete for a key through a time.
+
+    Emitted on the dimension stream of {py:obj}`temporal_join` to
+    advance the frontier of a key: after a watermark with `frontier`,
+    no more dimension events for that key with `effective_at <=
+    frontier` will arrive. Facts for the key with event times at or
+    before the frontier can then be resolved and emitted.
+
+    Watermarks are per key; emit one for each key that should make
+    progress. A dimension source that knows its key set (e.g. from a
+    snapshot of the dimension table) can periodically broadcast one
+    watermark per known key.
+
+    """
+
+    frontier: datetime
+    """Time through which the dimension is complete for this key."""
+
+
+DimEvent: TypeAlias = Union[DimUpsert[V], DimDelete, DimWatermark]
+"""Events on the dimension stream of {py:obj}`temporal_join`."""
+
+
+TemporalJoinStatus: TypeAlias = Literal["matched", "deleted", "no_version"]
+"""How a fact was resolved against the dimension versions.
+
+- *Matched*: A version effective at the fact's event time was found.
+
+- *Deleted*: The version effective at the fact's event time is a
+  {py:obj}`DimDelete` tombstone; the key did not exist at that time.
+
+- *No version*: No version with `effective_at` at or before the fact's
+  event time exists; the key was not yet known at that time.
+
+"""
+
+
+@dataclass(frozen=True)
+class TemporalJoined(Generic[F, V]):
+    """A fact joined to the dimension version effective at its event time.
+
+    Emitted on {py:obj}`TemporalJoinOut.joined`.
+    """
+
+    fact: F
+    """The original fact item."""
+
+    dim: Optional[V]
+    """The dimension value effective at the fact's event time, or
+    `None` if the key was deleted or not yet known then."""
+
+    effective_at: Optional[datetime]
+    """The `effective_at` of the dimension version used, or `None` if
+    no version existed at the fact's event time."""
+
+    status: TemporalJoinStatus
+    """How the fact was resolved; see
+    {py:obj}`~bytewax.operators.TemporalJoinStatus`."""
+
+
+@dataclass(frozen=True)
+class TemporalExpired(Generic[F]):
+    """A fact whose event time is older than the retained dimension history.
+
+    Emitted on {py:obj}`TemporalJoinOut.expired`. The versions needed
+    to resolve this fact correctly may already have been collected, so
+    it is routed here explicitly instead of being joined against a
+    potentially wrong version.
+
+    """
+
+    fact: F
+    """The original fact item."""
+
+    event_at: datetime
+    """Event time of the fact."""
+
+    horizon: datetime
+    """The retention horizon the fact fell below: the oldest event
+    time still guaranteed to resolve correctly when the fact was
+    seen."""
+
+
+@dataclass(frozen=True)
+class TemporalJoinOut(Generic[F, V]):
+    """Streams returned from the {py:obj}`temporal_join` operator."""
+
+    joined: KeyedStream[TemporalJoined[F, V]]
+    """Each fact that could be resolved within the retained history,
+    joined with the dimension version effective at its event time."""
+
+    expired: KeyedStream[TemporalExpired[F]]
+    """Each fact whose event time fell below the retention horizon
+    before it could be resolved."""
+
+
+@dataclass
+class _DimVersion(Generic[V]):
+    """A single version of a dimension value."""
+
+    effective_at: datetime
+    seq: Any
+    value: Optional[V]
+    deleted: bool
+
+
+@dataclass
+class _PendingFact(Generic[F]):
+    """A fact waiting for the dimension frontier."""
+
+    event_at: datetime
+    fact: F
+
+
+@dataclass
+class _TemporalJoinState(Generic[F, V]):
+    """Recoverable state of one key of a {py:obj}`temporal_join`."""
+
+    versions: List[_DimVersion[V]] = field(default_factory=list)
+    """All retained versions, sorted by `(effective_at, seq)`."""
+
+    pending: List[_PendingFact[F]] = field(default_factory=list)
+    """Facts waiting for the frontier, in arrival order."""
+
+    frontier: datetime = field(
+        default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc)
+    )
+    """Time through which the dimension is complete for this key."""
+
+
+_SIDE_FACT = 0
+_SIDE_DIM = 1
+
+_UTC_MIN: datetime = datetime.min.replace(tzinfo=timezone.utc)
+
+
+@dataclass
+class _TemporalJoinLogic(
+    StatefulLogic[Tuple[int, Any], Any, _TemporalJoinState[Any, Any]]
+):
+    fact_ts: Callable[[Any], datetime]
+    retention: timedelta
+    allowed_lateness: timedelta
+    state: _TemporalJoinState[Any, Any]
+
+    @override
+    def on_item(self, value: Tuple[int, Any]) -> Tuple[Iterable[Any], bool]:
+        side, payload = value
+        if side == _SIDE_DIM:
+            out: List[Any] = []
+            self._on_dim_event(payload, out)
+            return (out, StatefulLogic.RETAIN)
+        else:
+            item = self._on_fact(payload)
+            return ((item,) if item is not None else _EMPTY, StatefulLogic.RETAIN)
+
+    @override
+    def on_eof(self) -> Tuple[Iterable[Any], bool]:
+        # The dimension is complete for this execution; resolve
+        # everything that is still waiting. State is retained so a
+        # later execution can continue the join.
+        out = [
+            self._resolve(p.event_at, p.fact)
+            for p in sorted(self.state.pending, key=lambda p: p.event_at)
+        ]
+        self.state.pending = []
+        return (out, StatefulLogic.RETAIN)
+
+    @override
+    def snapshot(self) -> _TemporalJoinState[Any, Any]:
+        return copy.deepcopy(self.state)
+
+    def _on_fact(self, fact: Any) -> Optional[Any]:
+        event_at = self.fact_ts(fact)
+        if event_at <= self.state.frontier:
+            horizon = self._gc_horizon()
+            if event_at < horizon:
+                return TemporalExpired(fact=fact, event_at=event_at, horizon=horizon)
+            return self._resolve(event_at, fact)
+        else:
+            # The dimension has not caught up with this fact yet;
+            # wait for the frontier to advance.
+            self.state.pending.append(_PendingFact(event_at, fact))
+            return None
+
+    def _on_dim_event(self, event: DimEvent[Any], out: List[Any]) -> None:
+        if isinstance(event, DimWatermark):
+            self._advance_frontier(event.frontier, out)
+        elif isinstance(event, (DimUpsert, DimDelete)):
+            self._insert_version(
+                _DimVersion(
+                    effective_at=event.effective_at,
+                    seq=event.seq,
+                    value=event.value if isinstance(event, DimUpsert) else None,
+                    deleted=isinstance(event, DimDelete),
+                )
+            )
+            try:
+                derived = event.effective_at - self.allowed_lateness
+            except OverflowError:
+                derived = _UTC_MIN
+            self._advance_frontier(derived, out)
+        else:
+            msg = (
+                f"dimension events must be `DimUpsert`, `DimDelete`, or "
+                f"`DimWatermark`; got {event!r}"
+            )
+            raise TypeError(msg)
+
+    def _advance_frontier(self, new_frontier: datetime, out: List[Any]) -> None:
+        if new_frontier <= self.state.frontier:
+            return
+        self.state.frontier = new_frontier
+        # Resolve waiting facts first: collection below must never
+        # remove versions that still-waiting facts can resolve to.
+        still_pending: List[_PendingFact[Any]] = []
+        for pending in sorted(self.state.pending, key=lambda p: p.event_at):
+            if pending.event_at <= self.state.frontier:
+                out.append(self._resolve(pending.event_at, pending.fact))
+            else:
+                still_pending.append(pending)
+        self.state.pending = still_pending
+        self._collect_versions()
+
+    def _gc_horizon(self) -> datetime:
+        # Versions older than the horizon may be collected. Facts
+        # still waiting always have event times beyond the frontier,
+        # so capping the horizon at the oldest waiting fact is
+        # defensive; it can never delay collection in practice.
+        try:
+            horizon = self.state.frontier - self.retention
+        except OverflowError:
+            horizon = _UTC_MIN
+        for pending in self.state.pending:
+            if pending.event_at < horizon:
+                horizon = pending.event_at
+        return horizon
+
+    def _collect_versions(self) -> None:
+        horizon = self._gc_horizon()
+        versions = self.state.versions
+        # Index of the first version effective at or after the
+        # horizon; everything before it is collectable.
+        lo, hi = 0, len(versions)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if versions[mid].effective_at < horizon:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return
+        # Keep the newest version below the horizon as the floor: it
+        # is the correct answer for any retained event time that has
+        # no newer version at or before it.
+        self.state.versions = versions[lo - 1 :]
+
+    def _insert_version(self, version: _DimVersion[Any]) -> None:
+        versions = self.state.versions
+        key = (version.effective_at, version.seq)
+        lo, hi = 0, len(versions)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if (versions[mid].effective_at, versions[mid].seq) < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if (
+            lo < len(versions)
+            and (
+                versions[lo].effective_at,
+                versions[lo].seq,
+            )
+            == key
+        ):
+            # Same `(effective_at, seq)`: replace, so re-delivered CDC
+            # events (e.g. replayed after recovery) are idempotent.
+            versions[lo] = version
+        else:
+            versions.insert(lo, version)
+
+    def _resolve(self, event_at: datetime, fact: Any) -> TemporalJoined[Any, Any]:
+        version = self._version_at(event_at)
+        if version is None:
+            return TemporalJoined(
+                fact=fact, dim=None, effective_at=None, status="no_version"
+            )
+        elif version.deleted:
+            return TemporalJoined(
+                fact=fact, dim=None, effective_at=version.effective_at, status="deleted"
+            )
+        else:
+            return TemporalJoined(
+                fact=fact,
+                dim=version.value,
+                effective_at=version.effective_at,
+                status="matched",
+            )
+
+    def _version_at(self, event_at: datetime) -> Optional[_DimVersion[Any]]:
+        # The effective version is the greatest one by
+        # `(effective_at, seq)` with `effective_at <= event_at`.
+        versions = self.state.versions
+        lo, hi = 0, len(versions)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if versions[mid].effective_at <= event_at:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return None
+        return versions[lo - 1]
+
+
+@operator
+def temporal_join(
+    step_id: str,
+    facts: KeyedStream[F],
+    dim: KeyedStream[DimEvent[V]],
+    *,
+    fact_ts: Callable[[F], datetime],
+    retention: timedelta,
+    allowed_lateness: timedelta = timedelta(0),
+) -> TemporalJoinOut[F, V]:
+    """Join facts to the dimension version effective at their event time.
+
+    This is a temporal (as-of) join: each fact is matched with the
+    version of the dimension that was in effect when the fact
+    happened, not with the latest version seen. Use it when a fact
+    stream (e.g. transactions) must be attributed to slowly changing
+    dimension values (e.g. customer tiers) maintained by a CDC feed.
+
+    ```{testcode}
+    from datetime import datetime, timedelta, timezone
+
+    import bytewax.operators as op
+    from bytewax.dataflow import Dataflow
+    from bytewax.operators import DimUpsert, DimWatermark
+    from bytewax.testing import TestingSource, run_main
+
+    UTC = timezone.utc
+    flow = Dataflow("temporal_join_eg")
+
+    # `(customer_id, transaction)`; the transaction carries its event
+    # time. `tx_1` happened while the customer was still "silver",
+    # `tx_2` after the upgrade to "gold".
+    facts_l = [
+        ("cust_1", {"tx": "tx_1", "at": datetime(2024, 1, 10, tzinfo=UTC)}),
+        ("cust_1", {"tx": "tx_2", "at": datetime(2024, 2, 10, tzinfo=UTC)}),
+    ]
+    facts = op.input("facts", flow, TestingSource(facts_l))
+
+    # CDC feed of the customer dimension table, plus a watermark
+    # declaring the dimension complete through March.
+    dim_l = [
+        ("cust_1", DimUpsert(datetime(2024, 1, 1, tzinfo=UTC), "silver", seq=1)),
+        ("cust_1", DimUpsert(datetime(2024, 2, 1, tzinfo=UTC), "gold", seq=2)),
+        ("cust_1", DimWatermark(datetime(2024, 3, 1, tzinfo=UTC))),
+    ]
+    dim = op.input("dim", flow, TestingSource(dim_l))
+
+    out = op.temporal_join(
+        "temporal_join",
+        facts,
+        dim,
+        fact_ts=lambda tx: tx["at"],
+        retention=timedelta(days=30),
+    )
+    # Each item on `out.joined` is a `TemporalJoined` with the fact,
+    # the dimension value, the version's effective time, and a status.
+    tiers = op.map_value("tiers", out.joined, lambda j: (j.fact["tx"], j.dim))
+    _ = op.inspect("joined", tiers)
+    ```
+
+    ```{testcode}
+    :hide:
+
+    from bytewax.testing import run_main
+
+    run_main(flow)
+    ```
+
+    Each transaction is attributed to the tier in effect at the
+    transaction time, even though the dimension has moved on:
+
+    ```{testoutput}
+    temporal_join_eg.joined: ('cust_1', ('tx_1', 'silver'))
+    temporal_join_eg.joined: ('cust_1', ('tx_2', 'gold'))
+    ```
+
+    The dimension stream is a keyed stream of
+    {py:obj}`~bytewax.operators.DimUpsert`,
+    {py:obj}`~bytewax.operators.DimDelete`, and
+    {py:obj}`~bytewax.operators.DimWatermark` items. Versions of a key
+    are ordered by `(effective_at, seq)`, so multiple versions with
+    the same effective time resolve deterministically regardless of
+    arrival order, and re-delivered CDC events are idempotent.
+
+    A fact is only emitted once the dimension has caught up with the
+    fact's event time: the per-key frontier advances with each
+    dimension event (its `effective_at` minus `allowed_lateness`) and
+    with each {py:obj}`~bytewax.operators.DimWatermark`, and facts
+    beyond the frontier wait. Facts for keys whose dimension never
+    changes are emitted when the frontier is advanced by watermarks,
+    or at the latest when the upstream is EOF. Dimension events
+    arriving after the frontier has passed their `effective_at` are
+    still applied, but facts already emitted are not revised; set
+    `allowed_lateness` to the maximum lateness of the CDC feed to
+    avoid this.
+
+    Versions older than `retention` behind the frontier are collected
+    once no waiting fact can still resolve to them. Facts that arrive
+    with an event time older than the retained history are emitted on
+    {py:obj}`TemporalJoinOut.expired` instead of being joined against
+    a potentially wrong version.
+
+    All state (versions, waiting facts, the frontier) is part of the
+    operator snapshot, so resuming after an interruption re-resolves
+    waiting facts to the same versions and produces the same results.
+
+    :arg step_id: Unique ID.
+
+    :arg facts: Keyed stream of fact items.
+
+    :arg dim: Keyed stream of dimension events; see
+        {py:obj}`~bytewax.operators.DimEvent`.
+
+    :arg fact_ts: Called on each fact to get its event time.
+
+    :arg retention: How far behind the frontier dimension history is
+        retained. Facts older than this are routed to
+        {py:obj}`TemporalJoinOut.expired`.
+
+    :arg allowed_lateness: How far dimension events may lag behind
+        the frontier they imply. The frontier derived from a dimension
+        event is its `effective_at` minus this. Must be at least the
+        maximum lateness of the CDC feed for results to be final when
+        emitted. Defaults to zero.
+
+    :returns: A dataclass with the `joined` and `expired` streams.
+
+    """
+    if retention < timedelta(0):
+        msg = f"retention must be >= zero, got {retention!r}"
+        raise ValueError(msg)
+    if allowed_lateness < timedelta(0):
+        msg = f"allowed_lateness must be >= zero, got {allowed_lateness!r}"
+        raise ValueError(msg)
+
+    def shim_builder(
+        resume_state: Optional[_TemporalJoinState[Any, Any]],
+    ) -> StatefulLogic[Tuple[int, Any], Any, _TemporalJoinState[Any, Any]]:
+        state: _TemporalJoinState[Any, Any]
+        if resume_state is None:
+            state = _TemporalJoinState()
+        else:
+            state = resume_state
+        return _TemporalJoinLogic(fact_ts, retention, allowed_lateness, state)
+
+    labeled_facts = map_value("label_facts", facts, lambda f: (_SIDE_FACT, f))
+    labeled_dim = map_value("label_dim", dim, lambda e: (_SIDE_DIM, e))
+    merged = merge("merge", labeled_facts, labeled_dim)
+    out = stateful("join", merged, shim_builder)
+    branched = branch(
+        "split_expired", out, lambda kv: isinstance(kv[1], TemporalExpired)
+    )
+    joined = cast(KeyedStream[TemporalJoined[F, V]], branched.falses)
+    expired = cast(KeyedStream[TemporalExpired[F]], branched.trues)
+    return TemporalJoinOut(joined=joined, expired=expired)
